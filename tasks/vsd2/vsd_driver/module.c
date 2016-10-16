@@ -22,6 +22,8 @@ typedef struct vsd_dev {
 } vsd_dev_t;
 static vsd_dev_t *vsd_dev;
 
+static unsigned int vm_open_counter = 0;
+
 static int vsd_dev_open(struct inode *inode, struct file *filp)
 {
     pr_notice(LOG_TAG "opened\n");
@@ -45,7 +47,7 @@ static ssize_t vsd_dev_read(struct file *filp,
 
     if (copy_to_user(read_user_buf, vsd_dev->vbuf + *fpos, read_size))
         return -EFAULT;
- 
+
     *fpos += read_size;
     return read_size;
 }
@@ -107,7 +109,7 @@ static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
 static long vsd_ioctl_set_size(vsd_ioctl_set_size_arg_t __user *uarg)
 {
     vsd_ioctl_set_size_arg_t arg;
-    if (0 /* TODO device is currently mapped */)
+    if (vm_open_counter/* TODO device is currently mapped */)
         return -EBUSY;
 
     if (copy_from_user(&arg, uarg, sizeof(arg)))
@@ -134,15 +136,27 @@ static long vsd_dev_ioctl(struct file *filp, unsigned int cmd,
     }
 }
 
-static struct vm_operations_struct vsd_dev_vma_ops = {};
+static void vm_vsd_dev_open(struct vm_area_struct *vma) {
+    ++vm_open_counter;
+}
+
+static void vm_vsd_dev_close(struct vm_area_struct *vma) {
+    --vm_open_counter;
+}
+
+
+static struct vm_operations_struct vsd_dev_vma_ops = {
+    .open = vm_vsd_dev_open,
+    .close = vm_vsd_dev_close
+};
 
 static int map_vmalloc_range(struct vm_area_struct *uvma, void *kaddr, size_t size)
 {
+    unsigned long cur_offset = 0;
     unsigned long uaddr = uvma->vm_start;
     if (!PAGE_ALIGNED(uaddr) || !PAGE_ALIGNED(kaddr)
             || !PAGE_ALIGNED(size))
         return -EINVAL;
-
     /*  
      * Remember that all the work with memory is done using pages.
      * PAGE_SIZE is minimal size of memory we can map/unmap
@@ -152,8 +166,22 @@ static int map_vmalloc_range(struct vm_area_struct *uvma, void *kaddr, size_t si
      * Use vmalloc_to_page and vm_insert_page functions for this.
      */
     // TODO
+    while (cur_offset < size) {
+        struct page* cur_page;
+
+        if (!(cur_page = vmalloc_to_page(kaddr + cur_offset))) {
+            return -EINVAL;
+        }
+
+        if (vm_insert_page(uvma, uvma->vm_start + cur_offset, cur_page)) {
+            return -EINVAL;
+        }
+
+        cur_offset += PAGE_SIZE;
+    }
 
     uvma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+
     return 0;
 }
 
@@ -176,6 +204,8 @@ static int vsd_dev_mmap(struct file *filp, struct vm_area_struct *vma)
 
     vma->vm_ops = &vsd_dev_vma_ops;
 
+    ++vm_open_counter;
+
     return 0;
 }
 
@@ -186,6 +216,7 @@ static struct file_operations vsd_dev_fops = {
     .read = vsd_dev_read,
     .write = vsd_dev_write,
     .llseek = vsd_dev_llseek,
+    .mmap = vsd_dev_mmap,
     .unlocked_ioctl = vsd_dev_ioctl
 };
 
