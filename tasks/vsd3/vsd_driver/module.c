@@ -26,6 +26,11 @@ typedef struct vsd_dev {
 } vsd_dev_t;
 static vsd_dev_t *vsd_dev;
 
+#define CMDFINISHED (vsd_dev->hwregs->cmd == VSD_CMD_NONE)
+
+DEFINE_MUTEX(lock);
+DECLARE_WAIT_QUEUE_HEAD(wait_queue);
+
 #define LOCAL_DEBUG 0
 static void print_vsd_dev_hw_regs(vsd_dev_t *vsd_dev)
 {
@@ -65,34 +70,99 @@ static int vsd_dev_release(struct inode *inode, struct file *filp)
 static void vsd_dev_dma_op_complete_tsk_func(unsigned long unused)
 {
     (void)unused;
-    // TODO wake up thread waiting for VSD cmd completion
+    wake_up(&wait_queue);
 }
 
 static ssize_t vsd_dev_read(struct file *filp,
     char __user *read_user_buf, size_t read_size, loff_t *fpos)
 {
-    (void)filp;
-    (void)read_user_buf;
-    (void)read_size;
-    (void)fpos;
-    // TODO
-    return -EINVAL;
+    int ret = 0;
+
+    char* buf = kzalloc(read_size, GFP_KERNEL);
+
+    if (!buf) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    mutex_lock(&lock);
+
+    vsd_dev->hwregs->dma_paddr = virt_to_phys(buf);
+    vsd_dev->hwregs->dma_size = read_size;
+    vsd_dev->hwregs->dev_offset = *fpos;
+    vsd_dev->hwregs->tasklet_vaddr = (uint64_t) &vsd_dev->dma_op_complete_tsk;
+    wmb();
+    vsd_dev->hwregs->cmd = VSD_CMD_READ;
+
+    wait_event_killable(wait_queue, CMDFINISHED);
+
+    if ((ret = vsd_dev->hwregs->result) < 0) {
+        goto unlock;
+    }
+
+    if (copy_to_user(read_user_buf, buf, read_size)) {
+        ret = -EFAULT;
+        goto unlock;
+    }
+
+    *fpos += read_size;
+
+unlock:
+    mutex_unlock(&lock);
+
+    kfree(buf);
+err:
+    return ret;
 }
 
 static ssize_t vsd_dev_write(struct file *filp,
     const char __user *write_user_buf, size_t write_size, loff_t *fpos)
 {
-    (void)filp;
-    (void)write_user_buf;
-    (void)write_size;
-    (void)fpos;
-    // TODO
-    return -EINVAL;
+    int ret = 0;
+
+    char* buf = kzalloc(write_size, GFP_KERNEL);
+
+    if (!buf) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    if (copy_from_user(buf, write_user_buf, write_size)) {
+        ret = -EFAULT;
+        goto free;
+    }
+
+    mutex_lock(&lock);
+
+    vsd_dev->hwregs->dma_paddr = virt_to_phys(buf);
+    vsd_dev->hwregs->dma_size = write_size;
+    vsd_dev->hwregs->dev_offset = *fpos;
+    vsd_dev->hwregs->tasklet_vaddr = (uint64_t) &vsd_dev->dma_op_complete_tsk;
+    wmb();
+    vsd_dev->hwregs->cmd = VSD_CMD_WRITE;
+
+    wait_event_killable(wait_queue, CMDFINISHED);
+
+    if ((ret = vsd_dev->hwregs->result) < 0) {
+        goto unlock;
+    }
+
+    *fpos += write_size;
+
+unlock:
+    mutex_unlock(&lock);
+free:
+    kfree(buf);
+err:
+    return ret;
 }
 
 static loff_t vsd_dev_llseek(struct file *filp, loff_t off, int whence)
 {
+    int ret = 0;
     loff_t newpos = 0;
+
+    mutex_lock(&lock);
 
     switch(whence) {
         case SEEK_SET:
@@ -105,33 +175,66 @@ static loff_t vsd_dev_llseek(struct file *filp, loff_t off, int whence)
             newpos = vsd_dev->hwregs->dev_size - off;
             break;
         default: /* can't happen */
-            return -EINVAL;
+            ret = -EINVAL;
+            goto unlock;
     }
-    if (newpos < 0) return -EINVAL;
+
+    if (newpos < 0) {
+        ret = -EINVAL;
+        goto unlock;
+    }
+
     if (newpos >= vsd_dev->hwregs->dev_size)
         newpos = vsd_dev->hwregs->dev_size;
 
     filp->f_pos = newpos;
-    return newpos;
+
+    ret = newpos;
+
+unlock:
+    mutex_unlock(&lock);
+    return ret;
 }
 
 static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
 {
     vsd_ioctl_get_size_arg_t arg;
-    if (copy_from_user(&arg, uarg, sizeof(arg)))
-        return -EFAULT;
 
+    mutex_lock(&lock);
     arg.size = vsd_dev->hwregs->dev_size;
+    mutex_unlock(&lock);
 
     if (copy_to_user(uarg, &arg, sizeof(arg)))
         return -EFAULT;
+
     return 0;
 }
 
 static long vsd_ioctl_set_size(vsd_ioctl_set_size_arg_t __user *uarg)
 {
-    (void)uarg;
-    return -EINVAL;
+    int ret = 0;
+    vsd_ioctl_set_size_arg_t arg;
+
+    if (copy_from_user(&arg, uarg, sizeof(arg))) {
+        ret = -EFAULT;
+        goto err;
+    }
+
+    mutex_lock(&lock);
+
+    vsd_dev->hwregs->dev_offset = arg.size;
+    vsd_dev->hwregs->tasklet_vaddr = (uint64_t) &vsd_dev->dma_op_complete_tsk;
+    wmb();
+    vsd_dev->hwregs->cmd = VSD_CMD_SET_SIZE;
+
+    wait_event_killable(wait_queue, CMDFINISHED);
+
+    ret = vsd_dev->hwregs->result;
+
+    mutex_unlock(&lock);
+
+err:
+    return ret;
 }
 
 static long vsd_dev_ioctl(struct file *filp, unsigned int cmd,
@@ -166,6 +269,7 @@ static int vsd_driver_probe(struct platform_device *pdev)
 {
     int ret = 0;
     struct resource *vsd_control_regs_res = NULL;
+
     pr_notice(LOG_TAG "probing for device %s\n", pdev->name);
 
     vsd_dev = (vsd_dev_t*)
@@ -213,6 +317,7 @@ static int vsd_driver_remove(struct platform_device *dev)
 {
     // module can't be unloaded if its users has even single
     // opened fd
+
     pr_notice(LOG_TAG "removing device %s\n", dev->name);
     misc_deregister(&vsd_dev->mdev);
     kfree(vsd_dev);
