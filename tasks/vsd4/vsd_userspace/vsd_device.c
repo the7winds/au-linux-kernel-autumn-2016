@@ -25,14 +25,12 @@ int vsd_deinit()
 
 int vsd_set_blocking(void)
 {
-    // TODO
-    return -1;
+    return fcntl(vsd_fd, F_SETFL, fcntl(vsd_fd, F_GETFL) & (~O_NONBLOCK));
 }
 
 int vsd_set_nonblocking(void)
 {
-    // TODO
-    return -1;
+    return fcntl(vsd_fd, F_SETFL, fcntl(vsd_fd, F_GETFL) | O_NONBLOCK);
 }
 
 int vsd_get_size(size_t *out_size)
@@ -69,6 +67,20 @@ ssize_t vsd_write(const char* src, size_t size, off_t offset)
 
 int vsd_wait_nonblock_write(void)
 {
-    // TODO
-    return -1;
+    // FIXME CONTRACT FLAGS?
+    struct pollfd pfd = {
+        .fd = vsd_fd,
+        .events = POLLOUT,
+        .revents = 0
+    };
+
+    int ret;
+    while (1) {
+        ret = poll(&pfd, 1, 1000);
+        if (ret < 0) {
+            return -1;
+        } else if (ret == 1) {
+            return 0;
+        }
+    }
 }
